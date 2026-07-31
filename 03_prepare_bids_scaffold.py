@@ -23,7 +23,13 @@ What it does:
      key is currently absent (this dataset has no fieldmaps and no PE info at
      all; AP ("j-") is assumed per the old, deleted ant_03_processDTI.sh and
      confirmed by you). Every patch is logged, never silently unlogged.
-  6. Attempts a bids-validator pass (via `npx bids-validator`) and writes a
+  6. Patches TotalReadoutTime into DWI/BOLD JSON sidecars, ONLY where absent.
+     QSIPrep's eddy step requires this numeric value even with no SDC/topup
+     requested; the original scanner files that would carry the true value no
+     longer exist on this machine, so a nominal placeholder (0.05s) is used --
+     an assumption, not a measurement, confirmed by you. Logged to
+     derivatives/logs/03_json_patch_manifest_readout_time.tsv.
+  7. Attempts a bids-validator pass (via `npx bids-validator`) and writes a
      report. If Node/npx isn't installed on this machine, this step is skipped
      with a clear message rather than failing the whole script.
 
@@ -52,6 +58,18 @@ FS_LICENSE_SRC = Path("/usr/local/freesurfer/8.0.0/license.txt")
 FS_LICENSE_DST = DERIV / "freesurfer_license.txt"
 
 PE_DIRECTION_VALUE = "j-"  # AP, inferred (not measured) -- see README note
+
+# QSIPrep's eddy-prep step (hmc_sdc_wf.gather_inputs) requires a numeric
+# TotalReadoutTime for every DWI/BOLD file to build FSL eddy's acqparams.txt,
+# even when no SDC/topup is requested (confirmed via a 06_run_qsiprep.sh smoke
+# test crash: TypeError formatting spec['TotalReadoutTime'] == None). Original
+# PAR/REC scanner files (which would carry the real EchoSpacing/WFS) no longer
+# exist on this machine (/home/ubuntu/volume/raws is empty) -- there is no way
+# to recover a measured value. 0.05s is a commonly used nominal placeholder for
+# single-shot EPI when the true value is unknown; confirmed with you to use it.
+# This is an ASSUMPTION, not a measurement -- see README note and the
+# 03_json_patch_manifest_readout_time.tsv log for exactly which files were patched.
+TOTAL_READOUT_TIME_VALUE = 0.05
 
 # Expected demographics CSV columns (as given), and the participants.json
 # descriptions for each. Units marked TBD are genuinely unconfirmed -- flagged
@@ -129,6 +147,13 @@ def write_readme() -> None:
         "the site's historical acquisition protocol. This is an inferred default, "
         "not a measured value -- see derivatives/logs/03_json_patch_manifest.tsv "
         "for exactly which files were patched.\n"
+        "- Original JSON sidecars also did not record TotalReadoutTime for DWI or "
+        "BOLD, and the original scanner files that would carry the true value no "
+        "longer exist on this machine. QSIPrep's eddy step requires this value "
+        "even with no SDC/topup requested, so a nominal placeholder of 0.05s has "
+        "been patched in where absent. This is an assumption, not a measurement -- "
+        "see derivatives/logs/03_json_patch_manifest_readout_time.tsv for exactly "
+        "which files were patched.\n"
     )
     print(f"[write] {path}")
 
@@ -318,6 +343,32 @@ def patch_phase_encoding_direction() -> None:
           f"(manifest: {manifest_path})")
 
 
+def patch_total_readout_time() -> None:
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    manifest_path = LOG_DIR / "03_json_patch_manifest_readout_time.tsv"
+    rows = []
+    for code in bids_subject_codes():
+        subj_dir = BIDS_ROOT / f"sub-{code}"
+        json_files = sorted((subj_dir / "dwi").glob("*.json")) + sorted((subj_dir / "func").glob("*_bold.json"))
+        for jf in json_files:
+            data = json.loads(jf.read_text())
+            if "TotalReadoutTime" in data:
+                rows.append((f"sub-{code}", str(jf.relative_to(BIDS_ROOT)), "ALREADY_PRESENT", str(data["TotalReadoutTime"])))
+                continue
+            data["TotalReadoutTime"] = TOTAL_READOUT_TIME_VALUE
+            jf.write_text(json.dumps(data, indent=4) + "\n")
+            rows.append((f"sub-{code}", str(jf.relative_to(BIDS_ROOT)), "PATCHED", str(TOTAL_READOUT_TIME_VALUE)))
+
+    with manifest_path.open("w") as f:
+        f.write("subject\tfile\taction\tvalue\n")
+        for r in rows:
+            f.write("\t".join(r) + "\n")
+    patched = sum(1 for r in rows if r[2] == "PATCHED")
+    present = sum(1 for r in rows if r[2] == "ALREADY_PRESENT")
+    print(f"[TotalReadoutTime] patched {patched}, already present {present} "
+          f"(manifest: {manifest_path})")
+
+
 # --- 5. bids-validator --------------------------------------------------------
 
 def run_bids_validator() -> None:
@@ -360,6 +411,7 @@ def main() -> None:
     materialize_freesurfer_symlinks()
     copy_fs_license()
     patch_phase_encoding_direction()
+    patch_total_readout_time()
     if not args.skip_validator:
         run_bids_validator()
 
