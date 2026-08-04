@@ -100,7 +100,11 @@ process_subject () {
     local code=${bids_id#sub-}
     local work_dir="$WORK_ROOT/$bids_id"
     local log_file="$LOG_DIR/${bids_id}.log"
-    local report="$OUT_DIR/${bids_id}.html"
+    # QSIRecon 26.0.0 nests its subject report under a pipeline-named BIDS-derivatives
+    # subfolder rather than $OUT_DIR/<bids_id>.html directly -- confirmed empirically via
+    # the sub-asjt smoke test (2026-08-03): actual path is
+    # $OUT_DIR/derivatives/qsirecon-MRtrix3_fork-SS3T_act-HSVS/<bids_id>.html
+    local report="$OUT_DIR/derivatives/qsirecon-MRtrix3_fork-SS3T_act-HSVS/${bids_id}.html"
     local qsiprep_report="$QSIPREP_DIR/${bids_id}.html"
 
     if [ -f "$report" ]; then
