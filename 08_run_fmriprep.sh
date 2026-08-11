@@ -12,13 +12,18 @@
 # fsaverage5. NIfTI-only for this phase -- no --cifti-output (doubles
 # runtime/storage; revisit if a later gradient/SFC phase needs grayordinates).
 #
-# FreeSurfer subjects dir: derivatives/freesurfer/sub-<id> are symlinks
-# (../../../Tinception/subjects_fs_dir/<code>) materialized by
-# 03_prepare_bids_scaffold.py. Because BIDS_ROOT is bound into the container
-# at /data, the symlinks' relative targets resolve (from the container's
-# point of view) to /Tinception/subjects_fs_dir/<code> -- so that real host
-# directory is bound at the matching absolute container path below, same
-# pattern as 07_run_qsirecon.sh.
+# FreeSurfer subjects dir: unlike 07_run_qsirecon.sh (which only reads the
+# recon), fMRIPrep's --fs-subjects-dir must be WRITABLE -- confirmed via two
+# smoke-test crashes (2026-08-11): its fsdir_run node copytree's fsaverage/
+# fsaverage5 templates into the subjects dir root, and its surface pipeline
+# writes derived per-subject files (e.g. lh.midthickness) directly into
+# sub-<id>/surf/. The real recon lives in a lab-wide shared directory
+# (Tinception/subjects_fs_dir, ~600 other projects' subjects) that must
+# never be made writable. Fix: derivatives/freesurfer_writable/sub-<id> holds
+# real (dereferenced, not symlinked) per-subject copies that fMRIPrep is free
+# to modify -- staged on demand below if not already present (idempotent;
+# the initial 76-subject batch was seeded in bulk from copies already made
+# for the QSIRecon cluster-migration staging, an `mv` since same filesystem).
 #
 # CPU-only -- fMRIPrep has no GPU-accelerated steps by default, so no --nv
 # (unlike 06_run_qsiprep.sh, which requests --nv even though eddy_cpu ends
@@ -43,7 +48,7 @@ set -euo pipefail
 
 VOLUME=/home/ubuntu/volume
 BIDS_ROOT="$VOLUME/antinomics"
-FS_SUBJECTS_HOST_DIR="$VOLUME/Tinception/subjects_fs_dir"
+FS_WRITABLE_DIR="$BIDS_ROOT/derivatives/freesurfer_writable"
 OUT_DIR="$BIDS_ROOT/derivatives/fmriprep"
 WORK_ROOT="$VOLUME/work/fmriprep"
 LOG_DIR="$BIDS_ROOT/derivatives/logs/08_fmriprep"
@@ -64,7 +69,7 @@ NPROCS=6
 OMP_NTHREADS=4
 MEM_MB=18000          # x4 concurrent = 72GB of 117GB total, leaves headroom
 
-mkdir -p "$OUT_DIR" "$WORK_ROOT" "$LOG_DIR"
+mkdir -p "$OUT_DIR" "$WORK_ROOT" "$LOG_DIR" "$FS_WRITABLE_DIR"
 
 if [ ! -f "$MANIFEST" ]; then
     printf "subject\tstatus\ttimestamp\n" > "$MANIFEST"
@@ -78,7 +83,7 @@ update_manifest () {
 }
 export -f update_manifest
 export MANIFEST APPTAINER_BIN APPTAINER_CACHEDIR APPTAINER_TMPDIR TEMPLATEFLOW_CACHE \
-       FMRIPREP_SIF BIDS_ROOT FS_SUBJECTS_HOST_DIR OUT_DIR WORK_ROOT LOG_DIR \
+       FMRIPREP_SIF BIDS_ROOT FS_WRITABLE_DIR OUT_DIR WORK_ROOT LOG_DIR \
        NPROCS OMP_NTHREADS MEM_MB FS_LICENSE_CONTAINER_PATH OUTPUT_SPACES
 
 process_subject () {
@@ -103,13 +108,27 @@ process_subject () {
         return 0
     fi
 
+    local fs_writable_subject_dir="$FS_WRITABLE_DIR/$bids_id"
+    if [ ! -d "$fs_writable_subject_dir" ]; then
+        local fs_src
+        fs_src=$(readlink -f "$BIDS_ROOT/derivatives/freesurfer/$bids_id" 2>/dev/null || true)
+        if [ -z "$fs_src" ] || [ ! -d "$fs_src" ]; then
+            echo "[skip] $bids_id has no FreeSurfer recon -- nothing for fMRIPrep's anatomical stage to reuse"
+            update_manifest "$bids_id" NO_FREESURFER
+            return 0
+        fi
+        echo "[$bids_id] staging a writable FreeSurfer copy (one-time, ~320MB)"
+        cp -rL "$fs_src" "${fs_writable_subject_dir}.tmp"
+        mv "${fs_writable_subject_dir}.tmp" "$fs_writable_subject_dir"
+    fi
+
     echo "[$bids_id] running fMRIPrep"
     update_manifest "$bids_id" RUNNING
     mkdir -p "$work_dir"
 
     "$APPTAINER_BIN" run --cleanenv \
         -B "$BIDS_ROOT":/data:ro \
-        -B "$FS_SUBJECTS_HOST_DIR":/Tinception/subjects_fs_dir:ro \
+        -B "$FS_WRITABLE_DIR":/fs_subjects_dir \
         -B "$OUT_DIR":/out \
         -B "$work_dir":/work \
         -B "$TEMPLATEFLOW_CACHE":/opt/templateflow \
@@ -118,7 +137,7 @@ process_subject () {
         /data /out participant \
         --participant-label "$code" \
         --output-spaces $OUTPUT_SPACES \
-        --fs-subjects-dir /data/derivatives/freesurfer \
+        --fs-subjects-dir /fs_subjects_dir \
         --fs-license-file "$FS_LICENSE_CONTAINER_PATH" \
         --nprocs "$NPROCS" --omp-nthreads "$OMP_NTHREADS" --mem "$MEM_MB" \
         --work-dir /work \
